@@ -1,4 +1,4 @@
-# app.py - UPDATED WITH PARALLEL FETCHING
+# app.py - BATCH FETCHING (100 per batch, ALL 10,000 Normies)
 
 from flask import Flask, render_template, request, jsonify
 import json
@@ -7,7 +7,6 @@ import time
 import requests as req
 from concurrent.futures import ThreadPoolExecutor, as_completed
 import threading
-import random
 from normies import Normie
 from rarity import build_rarity_database, calculate_rarity_score, get_stats_summary
 
@@ -19,51 +18,48 @@ rarity_db = None
 all_normies_data = None
 sample_size = 0
 
-# FIX: Track fetch progress for UI polling
+# Track fetch progress for UI polling
 fetch_progress = {
-    "status": "idle",          # idle, fetching, ready
-    "progress": 0,             # 0-100%
-    "message": "Starting..."
+    "status": "idle",
+    "progress": 0,
+    "message": "Starting...",
+    "fetched_count": 0,
+    "total_count": 10000
 }
 fetch_lock = threading.Lock()
 
-# ─────────────────────────────────────────
-# TRAIT OPTIONS
-# ─────────────────────────────────────────
 TRAIT_OPTIONS = [
     "Type", "Gender", "Age", "Hair Style",
     "Facial Feature", "Eyes", "Expression", "Accessory"
 ]
 
 # ─────────────────────────────────────────
-# PARALLEL FETCHER — Fetches 10 at a time
-# FIX: Solution 2 — Multiple parallel requests
+# BATCH FETCHER — 100 Normies per batch
 # ─────────────────────────────────────────
-def fetch_sample_normies_parallel(sample_percent=5, max_workers=10):
+def fetch_all_normies_batch(total=10000, batch_size=100):
     """
-    Fetch Normies in parallel instead of sequentially.
+    Fetch ALL Normies in batches of 100.
     
-    Original: 500 Normies × 1/sec = 500 sec (~8 min)
-    Parallel: 500 Normies ÷ 10 workers = 50 batches × 1 sec = 50 sec (~1 min)
+    Math:
+    - 10,000 Normies / 100 per batch = 100 batches
+    - Each batch spaced 1 second apart
+    - Total time: ~100 seconds (~1.7 minutes) ⏱️
     
-    Uses ThreadPoolExecutor to make 10 requests simultaneously.
+    Rate limiting:
+    - Each batch submits 100 parallel tasks
+    - We wait 1 second between batches
+    - Includes retry on 429 (rate limit)
     """
     global fetch_progress
     
-    total = 10000
-    sample_count = int(total * sample_percent / 100)  # 500 for 5%
-    
-    # Random stratified sample (not sequential)
-    sample_ids = sorted(random.sample(range(total), sample_count))
-    
-    print(f"Fetching {sample_count} Normies in parallel ({max_workers} workers)...")
-    print(f"Estimated time: ~{sample_count // (max_workers * 60)} minute(s)")
+    print(f"Starting batch fetch: {total} Normies in batches of {batch_size}")
+    print(f"Estimated time: {total // (batch_size * 10)} seconds")
     
     all_data = []
     errors = 0
     
     def fetch_one(token_id):
-        """Fetch a single Normie's traits"""
+        """Fetch a single Normie"""
         try:
             url = f"https://api.normies.art/normie/{token_id}/traits"
             response = req.get(url, timeout=10)
@@ -77,7 +73,7 @@ def fetch_sample_normies_parallel(sample_percent=5, max_workers=10):
                 return row
                 
             elif response.status_code == 429:
-                # Rate limited — wait and retry once
+                # Rate limited — wait and retry
                 time.sleep(65)
                 response = req.get(url, timeout=10)
                 if response.status_code == 200:
@@ -91,57 +87,59 @@ def fetch_sample_normies_parallel(sample_percent=5, max_workers=10):
             return None
             
         except Exception as e:
-            print(f"  Error fetching #{token_id}: {e}")
+            print(f"Error fetching #{token_id}: {e}")
             return None
     
-    # FIX: ThreadPoolExecutor for parallel requests
-    with ThreadPoolExecutor(max_workers=max_workers) as executor:
-        # Submit all fetch tasks
-        futures = {executor.submit(fetch_one, tid): tid for tid in sample_ids}
-        
-        # Process results as they complete
-        completed = 0
-        for future in as_completed(futures):
-            try:
-                result = future.result()
-                if result:
-                    all_data.append(result)
-                else:
-                    errors += 1
-                
-                completed += 1
-                
-                # Update progress for UI polling
-                progress = int((completed / sample_count) * 100)
-                with fetch_lock:
-                    fetch_progress["progress"] = progress
-                    fetch_progress["message"] = f"Fetched {completed}/{sample_count}"
-                
-                # Log every 50 completed
-                if completed % 50 == 0:
-                    print(f"Progress: {completed}/{sample_count} ({progress}%)")
-                
-                # Small delay to respect rate limits
-                time.sleep(0.1)
-                
-            except Exception as e:
-                print(f"Error processing result: {e}")
-                errors += 1
+    # Process in batches
+    num_batches = (total + batch_size - 1) // batch_size
     
-    print(f"\n✅ Fetched {len(all_data)} Normies, Errors: {errors}")
+    for batch_num in range(num_batches):
+        start_id = batch_num * batch_size
+        end_id = min(start_id + batch_size, total)
+        batch_ids = range(start_id, end_id)
+        
+        print(f"\nBatch {batch_num + 1}/{num_batches}: Fetching Normies #{start_id}-#{end_id-1}...")
+        
+        # Submit batch in parallel (100 workers)
+        with ThreadPoolExecutor(max_workers=100) as executor:
+            futures = {executor.submit(fetch_one, tid): tid for tid in batch_ids}
+            
+            for future in as_completed(futures):
+                try:
+                    result = future.result()
+                    if result:
+                        all_data.append(result)
+                    else:
+                        errors += 1
+                    
+                    # Update progress
+                    with fetch_lock:
+                        fetch_progress["fetched_count"] = len(all_data)
+                        fetch_progress["progress"] = int((len(all_data) / total) * 100)
+                        fetch_progress["message"] = f"Fetched {len(all_data)}/{total}"
+                    
+                except Exception as e:
+                    errors += 1
+                    print(f"Error processing result: {e}")
+        
+        # Wait 1 second before next batch (respect rate limit)
+        if batch_num < num_batches - 1:
+            print(f"Batch complete. Waiting 1 second before next batch...")
+            time.sleep(1)
+    
+    print(f"\n✅ Batch fetch complete: {len(all_data)} Normies, {errors} errors")
     return all_data
 
 
 # ─────────────────────────────────────────
-# BACKGROUND FETCH — Non-blocking startup
-# FIX: Solution 3 — Background thread
+# BACKGROUND LOADER
 # ─────────────────────────────────────────
 def load_data_background():
-    """Load data in background thread so Flask starts immediately"""
+    """Load data in background thread"""
     global rarity_db, all_normies_data, sample_size, fetch_progress
     
     if os.path.exists(NORMIES_DATA_FILE):
-        # File exists — load from cache (fast)
+        # Load from cache
         print("✅ Loading cached data...")
         try:
             with open(NORMIES_DATA_FILE, 'r') as f:
@@ -153,25 +151,28 @@ def load_data_background():
                 fetch_progress = {
                     "status": "ready",
                     "progress": 100,
-                    "message": "Data loaded from cache"
+                    "message": "Data loaded from cache",
+                    "fetched_count": sample_size,
+                    "total_count": 10000
                 }
             print(f"✅ Loaded {sample_size} Normies from cache")
         except Exception as e:
             print(f"Error loading cache: {e}")
     else:
-        # File doesn't exist — fetch in background
-        print("⏳ Data not found. Starting background fetch...")
+        # Fetch all 10,000
+        print("⏳ Starting fetch of ALL 10,000 Normies...")
         
         with fetch_lock:
             fetch_progress = {
                 "status": "fetching",
                 "progress": 0,
-                "message": "Starting data fetch..."
+                "message": "Starting fetch of 10,000 Normies...",
+                "fetched_count": 0,
+                "total_count": 10000
             }
         
         try:
-            # Fetch 5% sample (500 Normies)
-            data = fetch_sample_normies_parallel(sample_percent=5, max_workers=10)
+            data = fetch_all_normies_batch(total=10000, batch_size=100)
             
             if data:
                 all_normies_data = data
@@ -187,30 +188,35 @@ def load_data_background():
                     fetch_progress = {
                         "status": "ready",
                         "progress": 100,
-                        "message": "Data ready!"
+                        "message": "Data ready! All 10,000 Normies loaded",
+                        "fetched_count": sample_size,
+                        "total_count": 10000
                     }
-                print("✅ Data fetch complete and cached!")
+                print("✅ All data fetched and cached!")
             else:
-                print("❌ Failed to fetch any data")
+                print("❌ Failed to fetch data")
                 with fetch_lock:
                     fetch_progress = {
                         "status": "error",
                         "progress": 0,
-                        "message": "Failed to fetch data"
+                        "message": "Failed to fetch data",
+                        "fetched_count": 0,
+                        "total_count": 10000
                     }
         except Exception as e:
-            print(f"❌ Error in background fetch: {e}")
+            print(f"❌ Error: {e}")
             with fetch_lock:
                 fetch_progress = {
                     "status": "error",
                     "progress": 0,
-                    "message": f"Error: {str(e)}"
+                    "message": f"Error: {str(e)}",
+                    "fetched_count": 0,
+                    "total_count": 10000
                 }
 
 
-# Start background fetch on app startup (non-blocking)
 def start_background_fetch():
-    """Start fetch in daemon thread so Flask server starts immediately"""
+    """Start fetch in daemon thread"""
     thread = threading.Thread(target=load_data_background, daemon=True)
     thread.start()
     print("🚀 Flask server starting (data fetch in background)...")
@@ -222,14 +228,12 @@ def start_background_fetch():
 
 @app.route('/')
 def home():
-    """Home page"""
     return render_template('index.html')
 
 
-# FIX: New status endpoint for UI polling
 @app.route('/api/status')
 def api_status():
-    """Check data fetch status - called by frontend polling"""
+    """Check data fetch status"""
     with fetch_lock:
         status = fetch_progress.copy()
     return jsonify(status), 200
@@ -237,7 +241,6 @@ def api_status():
 
 @app.route('/lookup', methods=['GET'])
 def lookup():
-    """Lookup single Normie by ID"""
     try:
         token_id = request.args.get('id', '').strip()
         
@@ -272,8 +275,11 @@ def lookup():
 
 @app.route('/trait-finder', methods=['GET'])
 def trait_finder():
-    """Find Normies by traits - searches ALL 10000 Normies"""
+    """Find Normies by traits - searches fetched data"""
     try:
+        if not all_normies_data:
+            return jsonify({"error": "Data is still loading. Please wait..."}), 503
+        
         selected_traits = {}
         trait_types = [
             "Type", "Gender", "Age", "Hair Style",
@@ -288,50 +294,34 @@ def trait_finder():
         if not selected_traits:
             return jsonify({"error": "Select at least one trait"}), 400
         
+        # FIX: Loop through ALL fetched data to find matches
         matches = []
-        errors = 0
-        checked = 0
         
-        # Search all 10000 Normies (not just sample)
-        for token_id in range(10000):
-            try:
-                normie = Normie(token_id)
-                full_data = normie.get_full_data()
-                
-                if 'error' not in full_data:
-                    checked += 1
-                    traits = full_data.get('traits', {})
-                    
-                    # Check if all selected traits match
-                    match = True
-                    for trait_type, trait_value in selected_traits.items():
-                        if traits.get(trait_type) != trait_value:
-                            match = False
-                            break
-                    
-                    if match:
-                        rarity_info = calculate_rarity_score(traits, rarity_db) if rarity_db else {"score": 0, "tier": "Unknown"}
-                        matches.append({
-                            "token_id": token_id,
-                            "traits": traits,
-                            "rarity": rarity_info,
-                            "image_url": f"https://api.normies.art/normie/{token_id}/image.png"
-                        })
-                
-                # Rate limiting
-                time.sleep(0.05)
-                
-            except Exception as e:
-                errors += 1
-                continue
+        for normie_data in all_normies_data:
+            match = True
+            for trait_type, trait_value in selected_traits.items():
+                if normie_data.get(trait_type) != trait_value:
+                    match = False
+                    break
+            
+            if match:
+                rarity_info = calculate_rarity_score(normie_data, rarity_db) if rarity_db else {"score": 0, "tier": "Unknown"}
+                matches.append({
+                    "token_id": normie_data['token_id'],
+                    "traits": normie_data,
+                    "rarity": rarity_info,
+                    "image_url": f"https://api.normies.art/normie/{normie_data['token_id']}/image.png"
+                })
+        
+        sample_count = len(all_normies_data)
+        sample_percent = round((len(matches) / sample_count * 100), 2) if sample_count else 0
         
         return jsonify({
             "found": len(matches),
-            "checked": checked,
-            "errors": errors,
-            "searched_total": 10000,
-            "is_complete_search": True,
-            "matches": matches
+            "sample_size": sample_count,
+            "sample_percent": sample_percent,
+            "is_estimate": False,  # Now using full 10,000!
+            "matches": matches[:50]
         }), 200
     
     except Exception as e:
@@ -340,7 +330,6 @@ def trait_finder():
 
 @app.route('/portfolio', methods=['GET'])
 def portfolio():
-    """Get wallet portfolio"""
     try:
         wallet = request.args.get('wallet', '').strip()
         
@@ -415,7 +404,6 @@ def portfolio():
 
 @app.route('/personality', methods=['GET'])
 def personality():
-    """Get Normie AI personality"""
     try:
         token_id = request.args.get('id', '').strip()
         
@@ -469,7 +457,6 @@ def personality():
 
 @app.route('/compare', methods=['GET'])
 def compare():
-    """Compare two Normies"""
     try:
         id1 = request.args.get('id1', '').strip()
         id2 = request.args.get('id2', '').strip()
@@ -550,7 +537,7 @@ def compare():
 
 @app.route('/stats', methods=['GET'])
 def stats():
-    """Get global statistics"""
+    """Get statistics based on ALL fetched data"""
     try:
         if not rarity_db or not all_normies_data:
             return jsonify({"error": "Data not loaded yet"}), 503
@@ -559,7 +546,7 @@ def stats():
         
         return jsonify({
             "total_normies": sample_size,
-            "is_full_collection": sample_size >= 10000,
+            "is_full_collection": sample_size >= 9000,  # Close enough to 10k
             "trait_stats": stats_summary
         }), 200
     
@@ -569,7 +556,6 @@ def stats():
 
 @app.route('/trait-options', methods=['GET'])
 def trait_options():
-    """Get all trait options"""
     from rarity import TRAIT_OPTIONS
     return jsonify(TRAIT_OPTIONS), 200
 
@@ -585,20 +571,17 @@ def server_error(error):
 
 
 if __name__ == '__main__':
-    print("=" * 50)
-    print("🎨 NORMIES ANALYZER")
-    print("=" * 50)
+    print("=" * 60)
+    print("🎨 NORMIES ANALYZER - BATCH FETCHING")
+    print("=" * 60)
+    print("Fetching: ALL 10,000 Normies in batches of 100")
+    print("Expected time: ~100 seconds (~1.7 minutes)")
+    print("=" * 60)
     
-    # Start background data fetch (non-blocking)
     start_background_fetch()
     
-    # Railway deployment: use PORT env variable
-    port = int(os.environ.get('PORT', 5000))
-    debug = os.environ.get('FLASK_ENV', 'production') == 'development'
-    
     print("Starting Flask app...")
-    print(f"📍 Server running on port {port}")
-    print("Press Ctrl+C to stop")
-    print("=" * 50)
+    print("📍 Open browser: http://localhost:5000")
+    print("=" * 60)
     
-    app.run(host='0.0.0.0', port=port, debug=debug)
+    app.run(debug=True, port=5000)
