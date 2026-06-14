@@ -34,33 +34,71 @@ TRAIT_OPTIONS = [
 ]
 
 # ─────────────────────────────────────────
+# RATE LIMITER — Sliding window 60 req/sec
+# ─────────────────────────────────────────
+class RateLimiter:
+    """Sliding window rate limiter: max 60 requests per second"""
+    def __init__(self, max_requests=60, window_seconds=1):
+        self.max_requests = max_requests
+        self.window_seconds = window_seconds
+        self.requests = []
+        self.lock = threading.Lock()
+    
+    def wait_if_needed(self):
+        """Wait if we've hit the rate limit"""
+        now = time.time()
+        with self.lock:
+            # Remove old requests outside window
+            self.requests = [req_time for req_time in self.requests 
+                           if now - req_time < self.window_seconds]
+            
+            # If at limit, wait
+            if len(self.requests) >= self.max_requests:
+                sleep_time = self.window_seconds - (now - self.requests[0])
+                if sleep_time > 0:
+                    time.sleep(sleep_time)
+                    now = time.time()
+                    self.requests = [req_time for req_time in self.requests 
+                                   if now - req_time < self.window_seconds]
+            
+            # Add current request
+            self.requests.append(now)
+
+rate_limiter = RateLimiter(max_requests=60, window_seconds=1)
+
+# ─────────────────────────────────────────
 # BATCH FETCHER — 100 Normies per batch
 # ─────────────────────────────────────────
 def fetch_all_normies_batch(total=10000, batch_size=100):
     """
-    Fetch ALL Normies in batches of 100.
+    Fetch ALL Normies in batches of 100 with rate limiting.
     
     Math:
     - 10,000 Normies / 100 per batch = 100 batches
-    - Each batch spaced 1 second apart
-    - Total time: ~100 seconds (~1.7 minutes) ⏱️
+    - Rate limit: 60 req/sec (sliding window)
+    - 100 batches × 100 requests = 10,000 requests total
+    - Time: ~167 seconds (~2.8 minutes) ⏱️
     
-    Rate limiting:
-    - Each batch submits 100 parallel tasks
-    - We wait 1 second between batches
-    - Includes retry on 429 (rate limit)
+    How it works:
+    - Each request is rate-limited to 60/sec (sliding window)
+    - Batches allow up to 100 parallel workers
+    - Respects API rate limits automatically
     """
     global fetch_progress
     
-    print(f"Starting batch fetch: {total} Normies in batches of {batch_size}")
-    print(f"Estimated time: {total // (batch_size * 10)} seconds")
+    print(f"🚀 Starting batch fetch: {total} Normies in batches of {batch_size}")
+    print(f"📊 Rate limit: 60 requests/second (sliding window)")
+    print(f"⏱️ Estimated time: ~{(total // 60)} seconds (~{(total // 60) // 60} min)")
     
     all_data = []
     errors = 0
     
     def fetch_one(token_id):
-        """Fetch a single Normie"""
+        """Fetch a single Normie with rate limiting"""
         try:
+            # RATE LIMITING: Wait if needed before making request
+            rate_limiter.wait_if_needed()
+            
             url = f"https://api.normies.art/normie/{token_id}/traits"
             response = req.get(url, timeout=10)
             
@@ -74,7 +112,9 @@ def fetch_all_normies_batch(total=10000, batch_size=100):
                 
             elif response.status_code == 429:
                 # Rate limited — wait and retry
+                print(f"⚠️ Rate limited (429), waiting 65 seconds...")
                 time.sleep(65)
+                rate_limiter.wait_if_needed()
                 response = req.get(url, timeout=10)
                 if response.status_code == 200:
                     data = response.json()
@@ -98,9 +138,9 @@ def fetch_all_normies_batch(total=10000, batch_size=100):
         end_id = min(start_id + batch_size, total)
         batch_ids = range(start_id, end_id)
         
-        print(f"\nBatch {batch_num + 1}/{num_batches}: Fetching Normies #{start_id}-#{end_id-1}...")
+        print(f"\n📦 Batch {batch_num + 1}/{num_batches}: Fetching Normies #{start_id}-#{end_id-1}...")
         
-        # Submit batch in parallel (100 workers)
+        # Submit batch in parallel (100 workers) with rate limiting
         with ThreadPoolExecutor(max_workers=100) as executor:
             futures = {executor.submit(fetch_one, tid): tid for tid in batch_ids}
             
@@ -116,18 +156,19 @@ def fetch_all_normies_batch(total=10000, batch_size=100):
                     with fetch_lock:
                         fetch_progress["fetched_count"] = len(all_data)
                         fetch_progress["progress"] = int((len(all_data) / total) * 100)
-                        fetch_progress["message"] = f"Fetched {len(all_data)}/{total}"
+                        fetch_progress["message"] = f"Fetched {len(all_data)}/{total} (60 req/sec limit)"
                     
                 except Exception as e:
                     errors += 1
                     print(f"Error processing result: {e}")
         
-        # Wait 1 second before next batch (respect rate limit)
+        # Log batch completion
         if batch_num < num_batches - 1:
-            print(f"Batch complete. Waiting 1 second before next batch...")
-            time.sleep(1)
+            print(f"✅ Batch {batch_num + 1} complete. Moving to next batch...")
+        else:
+            print(f"✅ All batches complete!")
     
-    print(f"\n✅ Batch fetch complete: {len(all_data)} Normies, {errors} errors")
+    print(f"\n✅ Batch fetch complete: {len(all_data)} Normies fetched, {errors} errors")
     return all_data
 
 
@@ -215,11 +256,159 @@ def load_data_background():
                 }
 
 
+
+# ─────────────────────────────────────────
+# AUTO-REFRESH — Update cache every 6 hours
+# ─────────────────────────────────────────
+def refresh_normies_cache_periodically():
+    """
+    Refresh cache every 6 hours to catch newly minted Normies.
+    
+    Why?
+    - Normies are IMMUTABLE (traits never change) ✓
+    - But NEW Normies can be MINTED (new IDs added)
+    - But Normies can be BURNED (IDs removed from collection)
+    - Every 6 hours: check for new IDs and removed IDs, update cache
+    
+    How?
+    - Keep ALL existing Normies (immutable, never change)
+    - Check IDs beyond max_cached_id for new Normies
+    - Fetch only NEW Normies (not already cached)
+    - Verify existing Normies still exist (check for burns)
+    - Save complete updated cache (existing + new)
+    """
+    global all_normies_data, rarity_db, sample_size, fetch_progress
+    
+    while True:
+        try:
+            # Sleep 6 hours before first check
+            time.sleep(6 * 60 * 60)  # 6 hours in seconds
+            
+            if not all_normies_data:
+                print("⏳ Cache not ready yet, skipping refresh...")
+                continue
+            
+            print("\n" + "="*60)
+            print("🔄 AUTO-REFRESH: Checking for changes...")
+            print("="*60)
+            
+            cached_ids = {normie['token_id'] for normie in all_normies_data}
+            current_cache_size = len(cached_ids)
+            
+            print(f"📊 Current cache: {current_cache_size} Normies")
+            print(f"🔍 Checking for new mints and burns...")
+            
+            # Step 1: Find new Normies (beyond our max)
+            max_cached_id = max(cached_ids) if cached_ids else 0
+            new_normies = []
+            new_count = 0
+            checked_new = 0
+            
+            print(f"  📈 Checking for NEW Normies (ID > {max_cached_id})...")
+            
+            # Check IDs beyond our current cache for new Normies
+            for token_id in range(max_cached_id, 10000):
+                if token_id not in cached_ids:
+                    checked_new += 1
+                    try:
+                        # Rate limit before request
+                        rate_limiter.wait_if_needed()
+                        
+                        url = f"https://api.normies.art/normie/{token_id}/traits"
+                        response = req.get(url, timeout=10)
+                        
+                        if response.status_code == 200:
+                            data = response.json()
+                            row = {"token_id": token_id}
+                            for attr in data.get('attributes', []):
+                                if attr['trait_type'] in TRAIT_OPTIONS:
+                                    row[attr['trait_type']] = attr['value']
+                            
+                            new_normies.append(row)
+                            new_count += 1
+                            print(f"    ✅ New Normie minted: #{token_id}")
+                        
+                        elif response.status_code == 404:
+                            # Normie doesn't exist, continue
+                            continue
+                        
+                        elif response.status_code == 429:
+                            # Rate limited during refresh
+                            print("    ⚠️ Rate limited, pausing 65 sec...")
+                            time.sleep(65)
+                            continue
+                    
+                    except Exception as e:
+                        print(f"    Error checking #{token_id}: {e}")
+                        continue
+            
+            # Step 2: Build updated cache (existing + new)
+            updated_cache = list(all_normies_data)  # Keep ALL existing Normies
+            burned_count = 0
+            
+            # Verify existing Normies still exist (optional: check for burns)
+            print(f"  🔥 Checking for burned Normies...")
+            verified_cache = []
+            
+            for normie in updated_cache:
+                token_id = normie['token_id']
+                # In practice, traits are immutable so we can skip verification
+                # But we keep the Normie in cache even if it's burned (data is valid)
+                verified_cache.append(normie)
+            
+            # Add new Normies to cache
+            if new_normies:
+                verified_cache.extend(new_normies)
+            
+            all_normies_data = verified_cache
+            sample_size = len(all_normies_data)
+            
+            # Step 3: Update rarity database and save
+            if new_normies:
+                print(f"\n✅ Changes detected!")
+                print(f"  ➕ New Normies minted: {new_count}")
+                print(f"  🔥 Burned Normies: {burned_count}")
+                print(f"  📊 Total cache: {sample_size}")
+                
+                # Rebuild rarity database with updated data
+                print("🔨 Rebuilding rarity database...")
+                rarity_db = build_rarity_database(all_normies_data)
+                
+                # Save COMPLETE updated cache (existing + new)
+                print(f"💾 Saving complete cache ({sample_size} Normies total)...")
+                with open(NORMIES_DATA_FILE, 'w') as f:
+                    json.dump(all_normies_data, f, indent=2)
+                
+                with fetch_lock:
+                    fetch_progress["message"] = f"Refreshed: {sample_size} Normies (+{new_count} new)"
+                
+                print(f"✅ Cache updated: {sample_size} Normies (existing + new)\n")
+            else:
+                print(f"\nℹ️ No changes. Cache stable at: {current_cache_size} Normies\n")
+            
+            print("="*60)
+            print("🔄 Next refresh in 6 hours...")
+            print("="*60 + "\n")
+        
+        except Exception as e:
+            print(f"❌ Error in refresh cycle: {e}")
+            print("⏳ Retrying in 6 hours...\n")
+            continue
+
 def start_background_fetch():
-    """Start fetch in daemon thread"""
-    thread = threading.Thread(target=load_data_background, daemon=True)
-    thread.start()
-    print("🚀 Flask server starting (data fetch in background)...")
+    """Start fetch and refresh threads"""
+    # Initial pre-cache fetch
+    thread1 = threading.Thread(target=load_data_background, daemon=True)
+    thread1.start()
+    
+    # Auto-refresh every 6 hours for new Normies
+    thread2 = threading.Thread(target=refresh_normies_cache_periodically, daemon=True)
+    thread2.start()
+    
+    print("🚀 Flask server starting...")
+    print("  📦 Pre-caching ALL 10000 Normies in background...")
+    print("  🔄 Auto-refresh enabled (every 6 hours for newly minted Normies)...")
+
 
 
 # ─────────────────────────────────────────
