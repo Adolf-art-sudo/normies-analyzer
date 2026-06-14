@@ -272,12 +272,8 @@ def lookup():
 
 @app.route('/trait-finder', methods=['GET'])
 def trait_finder():
-    """Find Normies by traits"""
+    """Find Normies by traits - searches ALL 10000 Normies"""
     try:
-        # Check if data is ready
-        if not all_normies_data:
-            return jsonify({"error": "Data is still loading. Please wait..."}), 503
-        
         selected_traits = {}
         trait_types = [
             "Type", "Gender", "Age", "Hair Style",
@@ -293,32 +289,49 @@ def trait_finder():
             return jsonify({"error": "Select at least one trait"}), 400
         
         matches = []
+        errors = 0
+        checked = 0
         
-        for normie_data in all_normies_data:
-            match = True
-            for trait_type, trait_value in selected_traits.items():
-                if normie_data.get(trait_type) != trait_value:
-                    match = False
-                    break
-            
-            if match:
-                rarity_info = calculate_rarity_score(normie_data, rarity_db) if rarity_db else {"score": 0, "tier": "Unknown"}
-                matches.append({
-                    "token_id": normie_data['token_id'],
-                    "traits": normie_data,
-                    "rarity": rarity_info,
-                    "image_url": f"https://api.normies.art/normie/{normie_data['token_id']}/image.png"
-                })
-        
-        sample_count = len(all_normies_data) if all_normies_data else 0
-        sample_percent = round((len(matches) / sample_count * 100), 2) if sample_count else 0
+        # Search all 10000 Normies (not just sample)
+        for token_id in range(10000):
+            try:
+                normie = Normie(token_id)
+                full_data = normie.get_full_data()
+                
+                if 'error' not in full_data:
+                    checked += 1
+                    traits = full_data.get('traits', {})
+                    
+                    # Check if all selected traits match
+                    match = True
+                    for trait_type, trait_value in selected_traits.items():
+                        if traits.get(trait_type) != trait_value:
+                            match = False
+                            break
+                    
+                    if match:
+                        rarity_info = calculate_rarity_score(traits, rarity_db) if rarity_db else {"score": 0, "tier": "Unknown"}
+                        matches.append({
+                            "token_id": token_id,
+                            "traits": traits,
+                            "rarity": rarity_info,
+                            "image_url": f"https://api.normies.art/normie/{token_id}/image.png"
+                        })
+                
+                # Rate limiting
+                time.sleep(0.05)
+                
+            except Exception as e:
+                errors += 1
+                continue
         
         return jsonify({
             "found": len(matches),
-            "sample_size": sample_count,
-            "sample_percent": sample_percent,
-            "is_estimate": sample_count < 10000,
-            "matches": matches[:50]
+            "checked": checked,
+            "errors": errors,
+            "searched_total": 10000,
+            "is_complete_search": True,
+            "matches": matches
         }), 200
     
     except Exception as e:
