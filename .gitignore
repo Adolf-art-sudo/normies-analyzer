@@ -1,0 +1,52 @@
+# Generated Data Files (fetched from API at runtime)
+normies_data.json
+normies_checkpoint.json
+
+# Cache & Temporary Files
+.DS_Store
+Thumbs.db
+.DS_Store
+*.swp
+*.swo
+*~
+.vscode/
+.idea/
+*.log
+
+# Python
+__pycache__/
+*.py[cod]
+*$py.class
+*.so
+.Python
+env/
+venv/
+ENV/
+build/
+develop-eggs/
+dist/
+downloads/
+eggs/
+.eggs/
+lib/
+lib64/
+parts/
+sdist/
+var/
+wheels/
+*.egg-info/
+.installed.cfg
+*.egg
+
+# Flask
+instance/
+.webassets-cache
+
+# Temporary fetch/progress files
+normies_checkpoint.json
+fetch_progress.json
+
+# OS Files
+.DS_Store
+Thumbs.db
+.gitkeep
